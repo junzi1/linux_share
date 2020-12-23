@@ -1,0 +1,139 @@
+简单地讲，OHCI、UHCI都是USB1.1的接口标准，而EHCI是对应USB2.0的接口标准，最新的xHCI是USB3.0的接口标准。
+1. OHCI（Open Host Controller Interface）是支持USB1.1的标准，但它不仅仅是针对USB，还支持其他的一些接口，比如它还支持Apple的火线（Firewire，IEEE 1394）接口。
+   与UHCI相比，OHCI的硬件复杂，硬件做的事情更多，所以实现对应的软件驱动的任务，就相对较简单。主要用于非x86的USB，如扩展卡、嵌入式开发板的USB主控。
+2. UHCI（Universal Host Controller Interface），是Intel主导的对USB1.0、1.1的接口标准，与OHCI不兼容。UHCI的软件驱动的任务重，需要做得比较复杂，但可以使用较
+   便宜、较简单的硬件的USB控制器。Intel和VIA使用UHCI，而其余的硬件提供商使用OHCI。
+3. EHCI（Enhanced Host Controller Interface），是Intel主导的USB2.0的接口标准。EHCI仅提供USB2.0的高速功能，而依靠UHCI或OHCI来提供对全速（full-speed）或低速
+  （low-speed）设备的支持。
+4. xHCI（eXtensible Host Controller Interface），是最新最火的USB3.0的接口标准，它在速度、节能、虚拟化等方面都比前面3中有了较大的提高。xHCI支持所有种类速度的
+   USB设备（USB 3.0 SuperSpeed, USB 2.0 Low-, Full-, and High-speed, USB 1.1 Low- and Full-speed）。xHCI的目的是为了替换前面3中（UHCI/OHCI/EHCI）。
+
+
+
+usb驱动分为 usb主机驱动和usb设备驱动，类似于spi的主控制器驱动和从设备驱动
+1 usb主机驱动，以ehci的主机控制驱动为例。主机驱动的结构体为struct usb_hcd,全称host controller driver ，参考ehci-npcm7xx.c
+struct usb_hcd
+    -> const struct hc_driver	*driver;	/* hw-specific hooks */    主机驱动的钩子函数
+        ->钩子函数
+        /* called to init HCD and root hub */
+        int	(*reset) (struct usb_hcd *hcd);
+        int	(*start) (struct usb_hcd *hcd);
+
+        /* NOTE:  these suspend/resume calls relate to the HC as
+        * a whole, not just the root hub; they're for PCI bus glue.
+        */
+        /* called after suspending the hub, before entering D3 etc */
+        int	(*pci_suspend)(struct usb_hcd *hcd, bool do_wakeup);
+
+        /* called after entering D0 (etc), before resuming the hub */
+        int	(*pci_resume)(struct usb_hcd *hcd, bool hibernated);
+
+        /* cleanly make HCD stop writing memory and doing I/O */
+        void	(*stop) (struct usb_hcd *hcd);
+
+        /* shutdown HCD */
+        void	(*shutdown) (struct usb_hcd *hcd);
+
+    -> unsigned long hcd_priv[]
+			__attribute__ ((aligned(sizeof(s64)))); 
+
+1.1 主机驱动属于平台设备驱动，当匹配上usb主机控制器的时候调用probe。重点在于 ehci_init_driver,会将ehci_hc_driver赋值给ehci_npcm7xx_hc_driver，
+第二个参数还可重写reset，port_power函数，调用完ehci_init_driver将会初始化hc_driver
+static const struct of_device_id npcm7xx_ehci_id_table[] = {
+	{ .compatible = "nuvoton,npcm750-ehci" },
+	{ },
+};
+
+static struct platform_driver npcm7xx_ehci_hcd_driver = {
+	.probe		= npcm7xx_ehci_hcd_drv_probe,
+	.remove		= npcm7xx_ehci_hcd_drv_remove,
+	.shutdown	= usb_hcd_platform_shutdown,
+	.driver		= {
+		.name = "npcm7xx-ehci",
+		.bus = &platform_bus_type,
+		.pm = &ehci_npcm7xx_pm_ops,
+		.of_match_table = npcm7xx_ehci_id_table,
+	}
+};
+
+static int __init ehci_npcm7xx_init(void)
+{
+	if (usb_disabled())
+		return -ENODEV;
+
+	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
+
+	ehci_init_driver(&ehci_npcm7xx_hc_driver, NULL);
+	return platform_driver_register(&npcm7xx_ehci_hcd_driver);
+}
+module_init(ehci_npcm7xx_init);
+
+void ehci_init_driver(struct hc_driver *drv,
+		const struct ehci_driver_overrides *over)
+{
+	/* Copy the generic table to drv and then apply the overrides */
+	*drv = ehci_hc_driver;
+
+	if (over) {
+		drv->hcd_priv_size += over->extra_priv_size;
+		if (over->reset)
+			drv->reset = over->reset;
+		if (over->port_power)
+			drv->port_power = over->port_power;
+	}
+}
+
+1.2 npcm7xx_ehci_hcd_drv_probe
+        -> usb_create_hcd
+        -> usb_add_hcd  // 完成usb主机控制驱动的注册
+
+2 usb设备驱动。usb设备驱动三元素 usb_driver，usb_bus_type，usb_device，类似于i2c从设备驱动和spi从设备驱动，不在赘述。
+  usb_device的创建推测是当一个usb从设备插上后，会给主机控制器一些信息，主机控制器拿到信息后，给到usb总线，usb总线负责查找符合的驱动
+  之后找到驱动就是调用probe，参考usb_skeleton.c
+struct bus_type usb_bus_type = {
+	.name =		"usb",
+	.match =	usb_device_match,
+	.uevent =	usb_uevent,
+	.need_parent_lock =	true,
+};
+
+static struct usb_device_id my_usb_id [] = {
+	{ USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT,
+		USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ }	/* Terminating entry */
+};
+static struct usb_driver my_usb_drv={
+   .name      ="junzi_usb",
+   .probe     =my_usb_probe,
+   .disconnect=my_usb_disconnect,
+   .id_table  =my_usb_id
+};
+static int my_usb_init()
+{
+   usb_register(&my_usb_drv);
+   return 0;
+}
+static void my_usb_exit()
+{
+   usb_deregister(&my_usb_drv);
+}
+
+2.1 usb从上到下包括:
+usb设备
+    -> usb配置 好几个配置
+    -> usb接口 一个配置有好几个接口，每个驱动负责处理一个接口，比如usb扬声器包括一个音频接口以及对旋钮和按钮的接口
+    -> usb端点 usb通信的最小单位，驱动负责跟具体的端点通信
+
+2.2 urb是负责通信的数据载体，初始化urb，重要的两点：1、会设置usb设备的端点作为目的地址或源地址 2、会设置所分配内存为源地址或目的地址，然后提交urb。
+    这样urb拿到信息后会调用一个完成回调函数，通知我们拿到了信息或者发送完了信息，然后驱动进行相应的动作。
+    usb_alloc_urb
+    usb_fill_bulk_urb(dev->bulk_in_urb,
+			dev->udev,
+			usb_rcvbulkpipe(dev->udev,
+				dev->bulk_in_endpointAddr),
+			dev->bulk_in_buffer,
+			min(dev->bulk_in_size, count),
+			skel_read_bulk_callback,
+			dev);
+    usb_submit_urb
+    然后skel_read_bulk_callback是完成回调，进行urb得到信息或者发送完信息时的动作

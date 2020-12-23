@@ -1,0 +1,304 @@
+1、最基本的三元素:
+1.1 struct device	dev; //设备
+        ->	struct device_private	*p;
+            ->	struct klist_node knode_bus;//设备节点,挂载在bus->p->klist_devices中
+
+1.2 struct device_driver driver; //设备驱动
+        ->	struct driver_private *p;
+            ->	struct klist_node knode_bus; //驱动节点，挂载在bus->p->klist_drivers中
+
+1.3 struct bus_type		*bus;  //总线
+    ->	struct subsys_private *p;
+        ->	struct klist klist_devices; //设备链表
+        -> 	struct klist klist_drivers; //驱动链表
+        总线有两个链表，一个设备链表，一个驱动链表
+        -> 	int (*match)(struct device *dev, struct device_driver *drv); 用来匹配驱动和设备
+
+2. 平台总线本质就是bus_type的一种类型，和i2c_bus_type，spi_bus_type平起平坐
+struct bus_type platform_bus_type = {
+	.name		= "platform",
+	.dev_groups	= platform_dev_groups,
+	.match		= platform_match,
+	.uevent		= platform_uevent,
+	.dma_configure	= platform_dma_configure,
+	.pm		= &platform_dev_pm_ops,
+};
+EXPORT_SYMBOL_GPL(platform_bus_type);
+
+struct bus_type i2c_bus_type = {
+	.name		= "i2c",
+	.match		= i2c_device_match,
+	.probe		= i2c_device_probe,
+	.remove		= i2c_device_remove,
+	.shutdown	= i2c_device_shutdown,
+};
+
+EXPORT_SYMBOL_GPL(i2c_bus_type);
+
+struct bus_type spi_bus_type = {
+	.name		= "spi",
+	.dev_groups	= spi_dev_groups,
+	.match		= spi_match_device,
+	.uevent		= spi_uevent,
+};
+EXPORT_SYMBOL_GPL(spi_bus_type);
+
+2.1 平台设备和平台驱动也是对device和device_driver的封装,跟i2c_device和i2c_driver平起平坐，运行原理都是match成功后，执行driver的probe
+struct platform_device {
+	const char	*name;
+	int		id;
+	bool		id_auto;
+	struct device	dev;  //-----------------------------------here
+};
+
+struct platform_driver {
+	int (*probe)(struct platform_device *);
+	int (*remove)(struct platform_device *);
+	void (*shutdown)(struct platform_device *);
+	int (*suspend)(struct platform_device *, pm_message_t state);
+	int (*resume)(struct platform_device *);
+	struct device_driver driver;  //-----------------------------------here
+	const struct platform_device_id *id_table;
+	bool prevent_deferred_probe;
+};
+
+struct i2c_device {
+	struct i2c_adapter *adap;
+        ->	struct device dev;		/* the adapter device */
+
+	u8 addr;
+	u8 *i2c_write_buffer;
+	u8 *i2c_read_buffer;
+	struct mutex *i2c_buffer_lock;
+};
+
+
+struct i2c_driver {
+	struct device_driver driver;   //-----------------------------------here
+	const struct i2c_device_id *id_table;
+
+	/* Device detection callback for automatic device creation */
+	int (*detect)(struct i2c_client *client, struct i2c_board_info *info);
+	const unsigned short *address_list;
+	struct list_head clients;
+
+	bool disable_i2c_core_irq_mapping;
+};
+
+3 i2c的驱动框架
+
+3.1 i2c适配器:用平台设备驱动的框架来实现的
+
+设备层: 注册平台设备 platform_device,里边含有i2c控制器的一些硬件资源信息
+驱动层: 匹配到设备后，拿到硬件资源信息，进行初始化，实现适配器的传输函数，并注册适配器 i2c_add_adapter
+总线层: i2c_bus_type，i2c_device_match用来匹配
+
+struct bus_type i2c_bus_type = {
+	.name		= "i2c",
+	.match		= i2c_device_match,
+	.probe		= i2c_device_probe,
+	.remove		= i2c_device_remove,
+	.shutdown	= i2c_device_shutdown,
+};
+
+此时系统里边便有了一个struct i2c_adapter，比如编号为0
+
+3.2 设备层，比如一个I2C接口的光照传感器接了上来,struct i2c_client *my_client
+
+调用i2c_get_adapter(0);  获取适配器
+struct i2c_client
+    -> 	struct i2c_adapter *adapter;	/* the adapter we sit on	*/
+接着注册该i2c_client
+
+3.2 驱动层，驱动probe函数得到了struct i2c_clien,从而就能利用字符设备驱动的框架实现读写
+i2c_transfer(struct i2c_adapter * adap, struct i2c_msg * msgs, int num)
+
+static int BH1750_probe(struct i2c_client *i2c_client)
+{ 
+       bh1750_client = i2c_client;
+        
+	   printk("has found\n");
+	   
+	   register_chrdev(BH1750_major, "bh1750", &BH1750_drv_fops);
+       BH1750_class = class_create(THIS_MODULE, "bh1750s");
+       BH1750_drv_class_device= device_create(BH1750_class,NULL,MKDEV(BH1750_major, 1),NULL,"bh1750");
+       return 0;
+}
+
+4 spi的驱动框架，类似于i2c,spi一般四个引脚 io,io,cs,clk
+
+4.1 spi主控制器:用平台设备驱动的框架来实现的
+
+设备层: 注册平台设备 platform_device,里边含有spi控制器的一些硬件资源信息
+驱动层: 匹配到设备后，拿到硬件资源信息，进行初始化，实现主控制器的传输函数，并注册主控制器 spi_register_master
+总线层: spi_bus_type，spi_device_match用来匹配
+struct bus_type spi_bus_type = {
+	.name		= "spi",
+	.dev_groups	= spi_dev_groups,
+	.match		= spi_match_device,
+	.uevent		= spi_uevent,
+};
+EXPORT_SYMBOL_GPL(spi_bus_type);
+
+
+此时系统里边便有了一个	struct spi_master *master; 特别注意 bus_num，每个spi控制器的bus_num都不一样，是唯一标识符
+还有transer函数，用来spi的传输
+#define spi_master			spi_controller
+struct spi_controller {
+	struct device	dev;
+
+	struct list_head list;
+
+	/* other than negative (== assign one dynamically), bus_num is fully
+	 * board-specific.  usually that simplifies to being SOC-specific.
+	 * example:  one SOC has three SPI controllers, numbered 0..2,
+	 * and one board's schematics might show it using SPI-2.  software
+	 * would normally use bus_num=2 for that controller.
+	 */
+	s16			bus_num;
+
+    int			(*transfer)(struct spi_device *spi,
+                    struct spi_message *mesg);
+
+}
+
+4.2 spi从设备 spi_board_info ，然后调用spi_register_board_info注册从设备到board_list,注意bus_num，决定了用哪个控制器
+spi_board_info对象用于描述 SPI设备信息，其大部分字段和spi_device结构相对应，bus_num字段则用来指定所属的控制器编号，通过spi_board_info结构，我们可以有两种方式向系统增加spi设备。
+第一种方式是在SPI控制器驱动已经被加载后，我们使用通用接口层提供的如下API来完成：
+             struct spi_device *spi_new_device(struct spi_master *master, struct spi_board_info *chip);
+第二种方式是在板子的初始化代码中，定义一个spi_board_info数组，然后通过以下API注册spi_board_info：
+            int spi_register_board_info(struct spi_board_info const *info, unsigned n);
+上面这个API会把每个spi_board_info挂在全局链表变量board_list上，并且遍历已经在系统中注册了的控制器，匹配上相应的控制器并取得它们的spi_master结构指针，最终也会通过spi_new_device
+函数添加SPI设备。因为spi_register_board_info可以在板子的初始化代码中调用，可能这时控制器驱动尚未加载，此刻无法取得相应的spi_master指针，不过不要担心，控制器驱动被加载时，一定会
+调用spi_register_master函数来注册spi_master结构，而spi_register_master函数会反过来遍历全局链表board_list上的spi_board_info，然后通过spi_new_device函数添加SPI设备。
+
+总之流程如下所示:
+4.2.1 如果发现了spi_master
+spi_register_board_info  //注册到board_list
+    ->list_for_each_entry(ctlr, &spi_controller_list, list)
+			spi_match_controller_to_boardinfo(ctlr,
+							  &bi->board_info); //遍历spi_controller_list控制列表，找到匹配的controller，然后调用spi_new_device注册spi_device
+4.2.2 如果未发现spi_master
+spi_register_master
+spi_register_controller
+    ->list_for_each_entry(bi, &board_list, list)
+		spi_match_controller_to_boardinfo(ctlr, &bi->board_info); //会遍历board_list找到匹配的spi_board_info，然后调用spi_new_device注册spi_device
+
+static void spi_match_controller_to_boardinfo(struct spi_controller *ctlr,
+					      struct spi_board_info *bi)
+{
+	struct spi_device *dev;
+
+	if (ctlr->bus_num != bi->bus_num)
+		return;
+
+	dev = spi_new_device(ctlr, bi);
+	if (!dev)
+		dev_err(ctlr->dev.parent, "can't create new device for %s\n",
+			bi->modalias);
+}
+
+struct spi_board_info {
+	/* the device name and module name are coupled, like platform_bus;
+	 * "modalias" is normally the driver name.
+	 *
+	 * platform_data goes to spi_device.dev.platform_data,
+	 * controller_data goes to spi_device.controller_data,
+	 * device properties are copied and attached to spi_device,
+	 * irq is copied too
+	 */
+	char		modalias[SPI_NAME_SIZE];
+	const void	*platform_data;
+	const struct property_entry *properties;
+	void		*controller_data;
+	int		irq;
+
+	/* slower signaling on noisy or low voltage boards */
+	u32		max_speed_hz;
+
+
+	/* bus_num is board specific and matches the bus_num of some
+	 * spi_controller that will probably be registered later.
+	 *
+	 * chip_select reflects how this chip is wired to that master;
+	 * it's less than num_chipselect.
+	 */
+	u16		bus_num;     //-----------------------------------here
+	u16		chip_select;
+
+	/* mode becomes spi_device.mode, and is essential for chips
+	 * where the default of SPI_CS_HIGH = 0 is wrong.
+	 */
+	u32		mode;
+
+	/* ... may need additional spi_device chip config data here.
+	 * avoid stuff protocol drivers can set; but include stuff
+	 * needed to behave without being bound to a driver:
+	 *  - quirks like clock rate mattering when not selected
+	 */
+};
+
+struct spi_device {
+	struct device		dev;
+	struct spi_controller	*controller;
+	struct spi_controller	*master;	/* compatibility layer */
+	u32			max_speed_hz;
+	u8			chip_select;
+	u8			bits_per_word;
+	bool			rt;
+	u32			mode;
+#define	SPI_CPHA	0x01			/* clock phase */
+#define	SPI_CPOL	0x02			/* clock polarity */
+#define	SPI_MODE_0	(0|0)			/* (original MicroWire) */
+#define	SPI_MODE_1	(0|SPI_CPHA)
+#define	SPI_MODE_2	(SPI_CPOL|0)
+#define	SPI_MODE_3	(SPI_CPOL|SPI_CPHA)
+#define	SPI_CS_HIGH	0x04			/* chipselect active high? */
+#define	SPI_LSB_FIRST	0x08			/* per-word bits-on-wire */
+#define	SPI_3WIRE	0x10			/* SI/SO signals shared */
+#define	SPI_LOOP	0x20			/* loopback mode */
+#define	SPI_NO_CS	0x40			/* 1 dev/bus, no chipselect */
+#define	SPI_READY	0x80			/* slave pulls low to pause */
+#define	SPI_TX_DUAL	0x100			/* transmit with 2 wires */
+#define	SPI_TX_QUAD	0x200			/* transmit with 4 wires */
+#define	SPI_RX_DUAL	0x400			/* receive with 2 wires */
+#define	SPI_RX_QUAD	0x800			/* receive with 4 wires */
+#define	SPI_CS_WORD	0x1000			/* toggle cs after each word */
+#define	SPI_TX_OCTAL	0x2000			/* transmit with 8 wires */
+#define	SPI_RX_OCTAL	0x4000			/* receive with 8 wires */
+#define	SPI_3WIRE_HIZ	0x8000			/* high impedance turnaround */
+	int			irq;
+	void			*controller_state;
+	void			*controller_data;
+	char			modalias[SPI_NAME_SIZE];
+	const char		*driver_override;
+	int			cs_gpio;	/* LEGACY: chip select gpio */
+	struct gpio_desc	*cs_gpiod;	/* chip select gpio desc */
+	struct spi_delay	word_delay; /* inter-word delay */
+
+	/* the statistics */
+	struct spi_statistics	statistics;
+
+	/*
+	 * likely need more hooks for more protocol options affecting how
+	 * the controller talks to each chip, like:
+	 *  - memory packing (12 bit samples into low bits, others zeroed)
+	 *  - priority
+	 *  - chipselect delays
+	 *  - ...
+	 */
+};
+
+4.3 spi从设备驱动 spi_driver ，得到spi_device,从而得到了控制器，利用控制器里实现的传输函数，即可完成相应任务
+struct spi_device_id {
+	char name[SPI_NAME_SIZE];
+	kernel_ulong_t driver_data;	/* Data private to the driver */
+};
+struct spi_driver {
+	const struct spi_device_id *id_table; //用来匹配多个从设备
+	int			(*probe)(struct spi_device *spi);
+	int			(*remove)(struct spi_device *spi);
+	void			(*shutdown)(struct spi_device *spi);
+	struct device_driver	driver;
+};
+

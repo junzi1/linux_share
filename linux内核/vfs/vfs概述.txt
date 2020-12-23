@@ -1,0 +1,151 @@
+整个vfs是在内存中创建的
+/home/junzi/junzi.txt junzi.txt也是个目录项，有对应的dentry
+
+1. 进程描述符和文件相关数据结构
+struct task_struct
+    ->struct fs_struct		*fs; /* Filesystem information: */
+    ->struct files_struct		*files;/* Open file information: */
+1.1
+struct fs_struct {
+	int users; //用户数目
+	spinlock_t lock;
+	seqcount_t seq;
+	int umask;
+	int in_exec; //当前正在执行的文件
+	struct path root, pwd; //根目录路径和当前工作目录路径
+} __randomize_layout;
+
+1.2
+/*
+ * Open file table structure
+ */
+struct files_struct {
+  /*
+   * read mostly part
+   */
+	atomic_t count;
+	bool resize_in_progress;
+	wait_queue_head_t resize_wait;
+
+	struct fdtable __rcu *fdt;
+	struct fdtable fdtab;
+  /*
+   * written part on a separate cache line in SMP
+   */
+	spinlock_t file_lock ____cacheline_aligned_in_smp;
+	unsigned int next_fd;
+	unsigned long close_on_exec_init[1];
+	unsigned long open_fds_init[1];
+	unsigned long full_fds_bits_init[1];
+	struct file __rcu * fd_array[NR_OPEN_DEFAULT]; //32位系统NR_OPEN_DEFAULT=32,64位系统NR_OPEN_DEFAULT=64，当前进程打开的文件描述符集合
+                                                //如果超过32或64，则fdt指向重新分配的file数组
+};
+
+struct fdtable {
+	unsigned int max_fds;
+	struct file __rcu **fd;      /* current fd array */
+	unsigned long *close_on_exec;
+	unsigned long *open_fds;
+	unsigned long *full_fds_bits;
+	struct rcu_head rcu;
+};
+
+2. file结构体
+struct file
+    -> file链表
+    union {
+		struct llist_node	fu_llist;
+		struct rcu_head 	fu_rcuhead;
+	} f_u;
+    ->	struct path		f_path; //路径
+    -> const struct file_operations	*f_op;
+
+struct path {
+	struct vfsmount *mnt; //挂载的文件系统实例
+	struct dentry *dentry; //目录项，其中含有inode：d_inode
+} __randomize_layout;
+
+struct vfsmount {
+	struct dentry *mnt_root;	/* root of the mounted tree */
+	struct super_block *mnt_sb;	/* pointer to superblock */
+	int mnt_flags;
+} __randomize_layout;
+
+3. dentry结构体
+struct dentry
+    -> struct dentry *d_parent;	/* parent directory */
+    -> struct inode *d_inode;		/* Where the name belongs to - NULL is negative */
+    -> struct list_head d_child;	/* child of parent list */ 通过这个节点加入父目录的d_subdirs
+	-> struct list_head d_subdirs;	/* our children */ 所有子目录形成的链表头部
+    -> 	const struct dentry_operations *d_op;
+    -> struct super_block *d_sb;	/* The root of the dentry tree */
+
+4. inode结构体（注意磁盘中的分区结构：超级块-inode区-数据区,磁盘中本身有静态的inode，比如ext2，ext3文件系统），内核中的inode是动态创建在内存中的，从磁盘的inode拷贝相应信息到内存的inode，不访问文件是不会创建的。
+   inode里边存放具体的文件信息，指向的块设备存放的具体文件内容，是文件的基本表示单位，一个inode对应一个文件
+struct inode
+    -> const struct inode_operations	*i_op;
+    -> 	struct super_block	*i_sb;
+    -> 	struct address_space	*i_mapping; //页缓存
+    ->  字符设备，网络设备，块设备对应的集合，这些设备抽象为文件
+    union {
+		struct pipe_inode_info	*i_pipe;
+		struct block_device	*i_bdev;
+		struct cdev		*i_cdev;
+		char			*i_link;
+		unsigned		i_dir_seq;
+	};
+    -> 目录项链表，一个文件对应的不止一个目录，比如硬链接
+    union {
+		struct hlist_head	i_dentry;
+		struct rcu_head		i_rcu;
+	};
+
+5. super_block 结构体,代表一个文件系统，含有一个文件系统的信息
+struct super_block
+    -> 	struct list_head	s_list;		/* super_block 链表 */
+    -> 	struct file_system_type	*s_type;  //文件系统类型
+    -> 	const struct super_operations	*s_op;
+    -> 	struct list_head	s_inodes;	/* all inodes */
+
+struct file_system_type {
+	const char *name; //如ext2，ext3等等
+	int fs_flags;
+#define FS_REQUIRES_DEV		1 
+#define FS_BINARY_MOUNTDATA	2
+#define FS_HAS_SUBTYPE		4
+#define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+#define FS_DISALLOW_NOTIFY_PERM	16	/* Disable fanotify permission events */
+#define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+	int (*init_fs_context)(struct fs_context *);
+	const struct fs_parameter_spec *parameters;
+	struct dentry *(*mount) (struct file_system_type *, int,
+		       const char *, void *);          //挂载该文件系统，需要实现的回调
+	void (*kill_sb) (struct super_block *);  //卸载文件系统需要调用
+	struct module *owner;
+	struct file_system_type * next;
+	struct hlist_head fs_supers;
+
+	struct lock_class_key s_lock_key;
+	struct lock_class_key s_umount_key;
+	struct lock_class_key s_vfs_rename_key;
+	struct lock_class_key s_writers_key[SB_FREEZE_LEVELS];
+
+	struct lock_class_key i_lock_key;
+	struct lock_class_key i_mutex_key;
+	struct lock_class_key i_mutex_dir_key;
+};
+
+6. 比如ext4的文件系统，调用register_filesystem注册
+static struct file_system_type ext4_fs_type = {
+	.owner		= THIS_MODULE,
+	.name		= "ext4",
+	.mount		= ext4_mount,
+	.kill_sb	= kill_block_super,
+	.fs_flags	= FS_REQUIRES_DEV,
+};
+
+err = register_filesystem(&ext4_fs_type);
+	if (err)
+		goto out;
+
+int register_filesystem(struct file_system_type * fs)

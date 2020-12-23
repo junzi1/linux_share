@@ -1,0 +1,45 @@
+回绕问题存在于 tcp的序列号回绕，内核的jiffies回绕
+
+目的在于解决变量溢出，比如 unsigned char a，当a从0一直增加到255，超过255即会溢出，会回绕到0，
+通常会加判断是不是回绕回去了，，比如a增加后if(a < last_var) 则发生了回绕， 但是有更好的方法，不用判断，如下
+
+关于jiffies值回绕，内核里边是这样解决的
+/*
+ *	These inlines deal with timer wrapping correctly. You are 
+ *	strongly encouraged to use them
+ *	1. Because people otherwise forget
+ *	2. Because if the timer wrap changes in future you won't have to
+ *	   alter your driver code.
+ *
+ * time_after(a,b) returns true if the time a is after time b.
+ *
+ * Do this with "<0" and ">=0" to only test the sign of the result. A
+ * good compiler would generate better code (and a really good compiler
+ * wouldn't care). Gcc is currently neither.
+ */
+#define time_after(a,b)		\
+	(typecheck(unsigned long, a) && \
+	 typecheck(unsigned long, b) && \
+	 ((long)((b) - (a)) < 0))
+#define time_before(a,b)	time_after(b,a)
+
+#define time_after_eq(a,b)	\
+	(typecheck(unsigned long, a) && \
+	 typecheck(unsigned long, b) && \
+	 ((long)((a) - (b)) >= 0))
+
+中心思想就在于：对于32位系统，a和b的差的绝对值<2^31-1。对于64位系统，a和b的差的绝对值<2^63-1。这样才能用time_after这组宏来进行判断
+
+
+main.c 为了方便说明，用了unsigned char代表unsigned long来说明问题
+#define time_after(unknown,known) ((signed char)((known)-(unknown))<0)
+举了两个例子5和253，也就是如果当前要比对的时间是5或者253，差值在哪些范围能保证是合理的。127=2^7-1,
+1、先来说5，0-5 都是小于5的，6-132是大于5的，133等于5，134-255是小于5的。5+127 = 133所以 133-255是不合理区间的
+    5:0b0101
+    133:0b1000 0101       (signed char)(133-5) = -0
+    134:0b1000 0110       (signed char)(134-5) = -1
+
+2、再说253，254-255是大于253的，0-124是大于253，125等于253，126-253是小于253的。因为 253+127 = 125
+    253:0b1111 1101   补码是:0b11
+    125:0b0111 1101  (signed char)(125-153) 相当于 (signed char)(125+3) = 0 
+    126:0b0111 1110  (signed char)(126-153) 相当于 (signed char)(126+3) = （signed char）129= -1 

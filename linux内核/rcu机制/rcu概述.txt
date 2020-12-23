@@ -1,0 +1,20 @@
+rcu全称 read copy update
+
+任何一种锁机制写之间都是互斥的，需要获取锁，不能同时操作
+
+1、为什么会存在rcu这个机制？
+1.1 最开始是简单的读写锁，如果没有写的，大家都可以获取读锁，没有限制；如果有写的，需要等读锁都释放完之后，写锁才可以获取，然后去执行操作；同样，有写的时候，也不可以读，只能等写锁释放
+1.2 接着衍生出seq锁，顺序锁，优点在于写的时候不需要等待读的，读的线程需要判断是否写的更新过，更新过则需要重新读
+1.3 为了方便读，不需要这么多限制，衍生出了rcu
+
+2.三个角色 reader updater reclaimer的基本操作如下.
+updater: rcu_assign_pointer  修改完之后发布
+
+reader: 	rcu_read_lock();
+            //在这里读的数据要么是更新之前的，要么是更新之后的，不会乱套
+            rcu_dereference();  //读的是rcu_assign_pointer发布之后的内容
+		    rcu_read_unlock();
+
+reclaimer： call_rcu(); //异步回收旧的数据占用的内存 一般由updater写完调用
+            synchronize_rcu(); //同步回收 一般有updater写完调用
+            这两个操作会等待没有reader操作旧内存的时候然后回收

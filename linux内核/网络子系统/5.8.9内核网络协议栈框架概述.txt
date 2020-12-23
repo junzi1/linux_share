@@ -1,0 +1,304 @@
+1、概述：
+    新内核网络协议栈总体分层的思想和bsd的协议栈类似，尤其是socket层和协议层
+
+2、socket层
+2.1
+socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+struct socket {
+	socket_state		state;
+
+	short			type;
+
+	unsigned long		flags;
+
+	struct file		*file;
+	struct sock		*sk;     /*socket在网络层的表示，真正tcp或udp的操作函数在 sk.sk_prot
+                            比如bind操作   
+                            If the socket has its own bind function then use it. (RAW) 
+                            if (sk->sk_prot->bind) {
+                                return sk->sk_prot->bind(sk, uaddr, addr_len);
+                            }
+                            另外，接受队列和发送队列也在sock中，srcaddr，dstaddr，srcport，dstport也在sock中
+                            */
+	const struct proto_ops	*ops; //并不是具体tcp或udp的操作函数，而是通用的流式协议stream，数据报协议dgram，raw协议的操作集合
+                                
+
+	struct socket_wq	wq;
+};
+
+2.2
+接下来是struct inet_protosw inetsw_array，是socket调用协议层的操作集合，其中包括
+struct proto_ops *ops 上边说过的
+/* This is used to register socket interfaces for IP protocols.  */
+struct inet_protosw {
+	struct list_head list;
+
+        /* These two fields form the lookup key.  */
+	unsigned short	 type;	   /* This is the 2nd argument to socket(2). */
+	unsigned short	 protocol; /* This is the L4 protocol number.  */
+
+	struct proto	 *prot;
+	const struct proto_ops *ops;
+  
+	unsigned char	 flags;      /* See INET_PROTOSW_* below.  */
+};
+/* Upon startup we insert all the elements in inetsw_array[] into
+ * the linked list inetsw.
+ */
+static struct inet_protosw inetsw_array[] =
+{
+	{
+		.type =       SOCK_STREAM,
+		.protocol =   IPPROTO_TCP,
+		.prot =       &tcp_prot,       //tcp协议操作集合
+		.ops =        &inet_stream_ops,//流式协议操作集合，其中如果tcp协议有重复定义的函数，则优先调用tcp协议操作集合的函数
+                                        //比如tcp_prot和inet_stream_ops都有定义的connect，则优先调用tcp协议的；也不完全是
+                                        //这种情况，有些是先调用流式协议操作，再调用tcp协议的操作
+		.flags =      INET_PROTOSW_PERMANENT |
+			      INET_PROTOSW_ICSK,
+	},
+
+	{
+		.type =       SOCK_DGRAM,
+		.protocol =   IPPROTO_UDP,
+		.prot =       &udp_prot,
+		.ops =        &inet_dgram_ops,
+		.flags =      INET_PROTOSW_PERMANENT,
+       },
+
+       {
+		.type =       SOCK_DGRAM,
+		.protocol =   IPPROTO_ICMP,
+		.prot =       &ping_prot,
+		.ops =        &inet_sockraw_ops,
+		.flags =      INET_PROTOSW_REUSE,
+       },
+
+       {
+	       .type =       SOCK_RAW,
+	       .protocol =   IPPROTO_IP,	/* wild card */
+	       .prot =       &raw_prot,
+	       .ops =        &inet_sockraw_ops,
+	       .flags =      INET_PROTOSW_REUSE,
+       }
+};
+
+2.3 inetsw_array的里边的每种协议的操作集合都会注册到inetsw这个链表当中
+
+2.4 当创建socket的时候，会根据socket指定的协议调用create创建，对于AF_INET,对应的是inet_create
+struct net_proto_family {
+	int		family;
+	int		(*create)(struct net *net, struct socket *sock,
+				  int protocol, int kern);
+	struct module	*owner;
+};
+static const struct net_proto_family inet_family_ops = {
+	.family = PF_INET,
+	.create = inet_create,
+	.owner	= THIS_MODULE,
+};
+
+2.4 inet_create会将socket的指针赋值，值为inetsw_array具体协议的操作集合，比如
+循环inetsw查找协议操作集合
+list_for_each_entry_rcu(answer, &inetsw[sock->type], list) 
+sock->ops = answer->ops;
+sk_alloc
+    ->sk->sk_prot = sk->sk_prot_creator = prot;
+
+3. 协议层
+3.1 ip协议向链路层注册的包处理接口 ，通过dev_add_pack注册到ptype_all中，ptype_all在struct net_device中 	struct list_head ptype_all;
+struct packet_type {
+	__be16			type;	/* This is really htons(ether_type). */
+	bool			ignore_outgoing;
+	struct net_device	*dev;	/* NULL is wildcarded here	     */
+	int			(*func) (struct sk_buff *,
+					 struct net_device *,
+					 struct packet_type *,
+					 struct net_device *);
+	void			(*list_func) (struct list_head *,
+					      struct packet_type *,
+					      struct net_device *);
+	bool			(*id_match)(struct packet_type *ptype,
+					    struct sock *sk);
+	void			*af_packet_priv;
+	struct list_head	list;
+};
+
+static struct packet_type ip_packet_type __read_mostly = {
+	.type = cpu_to_be16(ETH_P_IP),
+	.func = ip_rcv,  //IP receive entry point
+	.list_func = ip_list_rcv,  /* Receive a list of IP packets */
+};
+
+3.2 传输层向ip层注册的包处理接口，通过inet_add_protocol注册到 inet_protos数组中
+/* This is used to register protocols. */
+struct net_protocol {
+	int			(*early_demux)(struct sk_buff *skb);
+	int			(*early_demux_handler)(struct sk_buff *skb);
+	int			(*handler)(struct sk_buff *skb);
+
+	/* This returns an error if we weren't able to handle the error. */
+	int			(*err_handler)(struct sk_buff *skb, u32 info);
+
+	unsigned int		no_policy:1,
+				netns_ok:1,
+				/* does the protocol do more stringent
+				 * icmp tag validation than simple
+				 * socket lookup?
+				 */
+				icmp_strict_tag_validation:1;
+};
+
+static struct net_protocol tcp_protocol = {
+	.early_demux	=	tcp_v4_early_demux,
+	.early_demux_handler =  tcp_v4_early_demux,
+	.handler	=	tcp_v4_rcv,
+	.err_handler	=	tcp_v4_err,
+	.no_policy	=	1,
+	.netns_ok	=	1,
+	.icmp_strict_tag_validation = 1,
+};
+
+4. 内核为每个CPU都分配一个这样的softnet_data数据空间，每个CPU都有一个这样的队列，用于接收数据包。讨论这个意义不大，只是想说一下这个概念，其中的napi_struct注意一下
+/*
+ * Incoming packets are placed on per-CPU queues
+ */
+struct softnet_data {
+	struct list_head	poll_list;
+	struct sk_buff_head	process_queue;
+
+	/* stats */
+	unsigned int		processed;
+	unsigned int		time_squeeze;
+	unsigned int		received_rps;
+#ifdef CONFIG_RPS
+	struct softnet_data	*rps_ipi_list;
+#endif
+#ifdef CONFIG_NET_FLOW_LIMIT
+	struct sd_flow_limit __rcu *flow_limit;
+#endif
+	struct Qdisc		*output_queue;
+	struct Qdisc		**output_queue_tailp;
+	struct sk_buff		*completion_queue;
+#ifdef CONFIG_XFRM_OFFLOAD
+	struct sk_buff_head	xfrm_backlog;
+#endif
+	/* written and read only by owning cpu: */
+	struct {
+		u16 recursion;
+		u8  more;
+	} xmit;
+#ifdef CONFIG_RPS
+	/* input_queue_head should be written by cpu owning this struct,
+	 * and only read by other cpus. Worth using a cache line.
+	 */
+	unsigned int		input_queue_head ____cacheline_aligned_in_smp;
+
+	/* Elements below can be accessed between CPUs for RPS/RFS */
+	call_single_data_t	csd ____cacheline_aligned_in_smp;
+	struct softnet_data	*rps_ipi_next;
+	unsigned int		cpu;
+	unsigned int		input_queue_tail;
+#endif
+	unsigned int		dropped;
+	struct sk_buff_head	input_pkt_queue;
+	struct napi_struct	backlog;
+
+};
+
+5.数据链路层
+5.1网卡驱动注册的收包函数，也就是中断接受函数,从此处开始，执行到deliver_skb开始协议层的处理
+netif_receive_skb    -process receive buffer from network
+    ->netif_receive_skb_internal
+        ->__netif_receive_skb
+            ->__netif_receive_skb_one_core  //根据报文协议比如ip，寻找ip的处理操作集合 struct packet_type *pt_prev
+                ->__netif_receive_skb_core
+                    ->deliver_skb
+
+6.收到一个数据包，从下到上所有流程 
+6.1 deliver_skb 调用  pt_prev->func，也就是ip的rcv函数 ip_rcv
+static inline int deliver_skb(struct sk_buff *skb,
+			      struct packet_type *pt_prev,
+			      struct net_device *orig_dev)
+{
+	if (unlikely(skb_orphan_frags_rx(skb, GFP_ATOMIC)))
+		return -ENOMEM;
+	refcount_inc(&skb->users);
+	return pt_prev->func(skb, skb->dev, pt_prev, orig_dev);
+}
+
+6.2 ip_rcv 处理完成交给传输层
+ip_rcv
+    ->ip_rcv_core      //ip的通用处理
+    ->ip_rcv_finish    //比如ip选项，分片重组之类
+        -> dst_input 根据目的地址的类型，选择处理函数
+            ->skb_dst(skb)->input(skb)
+该input函数在路由分配的时候,详细可以看rt_dst_alloc
+rt_dst_alloc
+    -> rt->dst.output = ip_output;
+	   if (flags & RTCF_LOCAL)
+	       rt->dst.input = ip_local_deliver;
+接着调用ip_local_deliver，Deliver IP Packets to the higher protocol layers
+ip_local_deliver
+    -> ip_local_deliver_finish
+        -> ip_protocol_deliver_rcu
+            -> 	ipprot = rcu_dereference(inet_protos[protocol]); 从inet_protos 3.2提到的
+                -> 调用传输层的接受函数，比如tcp的tcp_v4_rcv
+
+6.3 tcp_v4_rcv 传输层拿到这个帧，要根据目的ip地址，源ip地址，目的port，源port，从而确定是哪个sock接受
+tcp_v4_rcv
+    -> __inet_lookup_skb //2.1提到过sock中有保存的地址信息，sock根据是否连接等状态，有几个链表，__inet_lookup_skb根据这个在相应的链表中查找socket
+
+6.4 socket层拿到数据，然后再从内核拷贝到用户层
+
+7.发包流程跟收包完全相反，不做赘述
+  
+8.sock衍生出的结构体,都是基于sock,sock总是第一个成员，实际操作比如tcp的套接字，其实是tcp_sock
+8.1 struct inet_sock - representation of INET sockets
+struct inet_sock {
+	/* sk and pinet6 has to be the first two members of inet_sock */
+	struct sock		sk;
+#if IS_ENABLED(CONFIG_IPV6)
+	struct ipv6_pinfo	*pinet6;
+#endif
+	/* Socket demultiplex comparisons on incoming packets. */
+#define inet_daddr		sk.__sk_common.skc_daddr
+#define inet_rcv_saddr		sk.__sk_common.skc_rcv_saddr
+#define inet_dport		sk.__sk_common.skc_dport
+#define inet_num		sk.__sk_common.skc_num
+
+	__be32			inet_saddr;
+	__s16			uc_ttl;
+	__u16			cmsg_flags;
+	__be16			inet_sport;
+	__u16			inet_id;
+
+	struct ip_options_rcu __rcu	*inet_opt;
+	int			rx_dst_ifindex;
+	__u8			tos;
+	__u8			min_ttl;
+	__u8			mc_ttl;
+	__u8			pmtudisc;
+	__u8			recverr:1,
+				is_icsk:1,
+				freebind:1,
+				hdrincl:1,
+				mc_loop:1,
+				transparent:1,
+				mc_all:1,
+				nodefrag:1;
+	__u8			bind_address_no_port:1,
+				defer_connect:1; /* Indicates that fastopen_connect is set
+						  * and cookie exists so we defer connect
+						  * until first data frame is written
+						  */
+	__u8			rcv_tos;
+	__u8			convert_csum;
+	int			uc_index;
+	int			mc_index;
+	__be32			mc_addr;
+	struct ip_mc_socklist __rcu	*mc_list;
+	struct inet_cork_full	cork;
+};
+
+8.2 inet_sock衍生出的结构体 udp_sock,tcp_sock

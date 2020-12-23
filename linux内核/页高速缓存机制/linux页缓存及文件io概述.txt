@@ -1,0 +1,62 @@
+1、进程虚拟地址
+struct task_struct  //表示进程
+    ->struct mm_struct		*mm; //进程地址空间描述符
+        ->struct vm_area_struct *mmap; //虚拟地址空间，以链表形式组织，将bbs,data,text以rwx属性划分成独自的段
+            ->struct vm_area_struct *vm_next, *vm_prev;//链表形式组织，适合遍历
+            ->struct rb_node vm_rb; //红黑树形式组织，树的头为mm_struct中的mm_rb，即下边的这个，适合搜索，O(log n)
+        ->struct rb_root mm_rb;        //虚拟地址空间，以红黑树形式组织，方便查找
+
+2、进程能看到的只有虚拟地址，经过mmu转换或tlb命中得到物理地址（通过页表查询，目前linux为4级页表，每个页表9位，以及一个页表4Kb，占12位，总共4x9+12=48bits）
+
+3、实际物理地址(只介绍被用作页缓存时的结构变量)
+struct page
+    ->struct list_head lru; //页表缓存用lru链表组织
+    ->struct address_space *mapping; //对应的页表缓存结构
+    ->pgoff_t index; //以页为单位的偏移。在映射的虚拟空间（vma_area)内的偏移；一个文件可能只是映射了一部分，假设映射了1M的空间，那么index指的是1M空间内的偏移，而不是在整个文件内的偏移；
+
+4、read流程（比如读tmp.txt）
+struct file
+    ->struct inode		*f_inode;
+        ->struct address_space	*i_mapping; //tmp.txt映射的所有都在这个下边
+            ->struct inode		*host; //inode中有address_space，address_space中有inode，两者一一对应
+            ->struct xarray		i_pages; //含有pages，含有tmp.txt映射到内存的所有page
+            ->struct rb_root_cached	i_mmap; //Tree of private and shared mappings.vm_area_struct形成的树的根
+在struct vm_area_struct有如下成员,是i_mmap的树节点，这样就和具体进程的虚拟空间联系起来了，从struct vm_area_struct找到struct mm_struct在到struct task_struct: 
+    /*
+	 * For areas with an address space and backing store,
+	 * linkage into the address_space->i_mmap interval tree.
+	 */
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+
+4.1 先从这个文件中的i_pages寻找，根据偏移寻找,3里边说过page里边的index，就是映射部分的偏移
+/**
+ * find_get_page - find and get a page reference
+ * @mapping: the address_space to search
+ * @offset: the page index
+ *
+ * Looks up the page cache slot at @mapping & @offset.  If there is a
+ * page cache page, it is returned with an increased refcount.
+ *
+ * Otherwise, %NULL is returned.
+ */
+static inline struct page *find_get_page(struct address_space *mapping,pgoff_t offset)
+
+4.2 如果找到，则命中，直接读取，即从页缓存读取到用户空间，拷贝一次
+4.3 如果未找到，则未命中，此时产生缺页异常，分配一个address_space，然后从磁盘中读取数据到address_space的页中，然后重复4.2步骤，总共拷贝两次（磁盘拷贝到页缓存，页缓存拷贝到用户空间）
+
+5、write流程：流程跟read类似，如果能在address_space中找到page，则直接写页缓存，然后将page标记为脏；如果找不到page或者没有address_space，则产生缺页异常，分配一个address_space，然后从磁盘中读取数据到address_space的页中，
+然后将数据写到页缓存，将page标记为脏
+
+5.1 page标记为脏的，由系统的flusher线程统一异步写回
+
+6. mmap实现:mmap是通过增加一段线性的虚拟地址空间struct vm_area_struct,如果跟之前或之后的vm_area_struct属性相同，会合并成一个大的vm_area_struct。
+   接着将要读的文件从页缓存中找，找到的话，直接映射到虚拟地址空间，没找到，则进行4.3步骤，然后映射到虚拟地址空间。进程直接操作的就是页缓存了，少了从内核空间拷贝到用户空间这一步。
+   私有映射：如果写某个页，则会单独产生缺页异常，建立这个页的页缓存，不会影响其他进程的映射
+   共享映射：如果写某个页，直接改变的页缓存，导致这页变脏
+
+7. flusher线程写回:每个磁盘对应一个flusher线程，高效写回
+
+

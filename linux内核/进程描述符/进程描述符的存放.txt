@@ -1,0 +1,21 @@
+1、thread_union 包含了thread_info和stack，
+thread_union
+    -> thread_info 进程体系相关信息存放
+        ->task_struct 进程体系无关信息存放
+    ->stack 进程内核栈空间
+
+union thread_union {
+#ifndef CONFIG_ARCH_TASK_STRUCT_ON_STACK
+	struct task_struct task;
+#endif
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	struct thread_info thread_info;
+#endif
+	unsigned long stack[THREAD_SIZE/sizeof(long)];
+};
+
+2、当前进程描述符task_struct的指针，一般大部分存放在寄存器，方便访问，但是比如x86寄存器较少，所以存放在内核栈的栈底
+并且thread_union(一般首地址是thread_info)存放地址必须以2^13也就是8192为单位，这样寻找当前进程就简单了很多，首先获取
+当前栈指针esp（esp指针肯定运行在thread_union的stack内），接着将该指针的后13位变成0，变得到了thread_info的地址，从而
+得到了task_struct
+
